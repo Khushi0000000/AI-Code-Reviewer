@@ -8,6 +8,9 @@ import re
 import os
 import ast
 import difflib
+import io
+import zipfile
+from werkzeug.utils import secure_filename
 from datetime import datetime
 
 
@@ -373,6 +376,41 @@ def create_team():
     db.session.add(TeamMember(team_id=team.id, user_id=user_id, role="Owner"))
     db.session.commit()
     return jsonify({"success": True, "team": serialize_team(team, 1)}), 201
+
+
+@app.route("/api/teams/<int:team_id>", methods=["DELETE"])
+def delete_team(team_id):
+    user_id = get_current_user_id()
+    if not user_id:
+        return jsonify({"success": False, "error": "Authentication required. Please login first."}), 401
+
+    team = db.session.get(Team, team_id)
+    if not team:
+        return jsonify({"success": False, "error": "Team not found."}), 404
+
+    # Only the team owner can permanently delete the team.
+    if team.owner_id != user_id:
+        return jsonify({"success": False, "error": "Only the team owner can delete this team."}), 403
+
+    try:
+        # Delete child records first because the existing SQLite schema does not
+        # rely on database-level ON DELETE CASCADE rules.
+        TeamProject.query.filter_by(team_id=team_id).delete(synchronize_session=False)
+        TeamMember.query.filter_by(team_id=team_id).delete(synchronize_session=False)
+        team_name = team.name
+        db.session.delete(team)
+        db.session.commit()
+        return jsonify({
+            "success": True,
+            "message": f'Team "{team_name}" deleted successfully.'
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        print("DELETE TEAM ERROR:", e)
+        return jsonify({
+            "success": False,
+            "error": "Unable to delete team."
+        }), 500
 
 
 @app.route("/api/teams/<int:team_id>", methods=["GET"])
@@ -1295,6 +1333,9 @@ def get_reviews():
 
                 "language":
                     review.language,
+
+                "code":
+                    review.code,
 
                 "score":
                     review.score,
@@ -3437,6 +3478,375 @@ def database_status():
 
 
 # ============================================================
+# AUTO-FIX / FILE UPLOAD / DETAILED EXPLANATION
+# ============================================================
+
+SUPPORTED_SOURCE_EXTENSIONS = {
+    ".py": "Python",
+    ".js": "JavaScript",
+    ".jsx": "JavaScript",
+    ".ts": "JavaScript",
+    ".tsx": "JavaScript",
+    ".java": "Java",
+    ".c": "C++",
+    ".h": "C++",
+    ".cpp": "C++",
+    ".cc": "C++",
+    ".cxx": "C++",
+    ".hpp": "C++",
+    ".sql": "SQL",
+}
+
+
+def analyze_uploaded_code(code, language):
+    """Lightweight analysis used for uploaded files without creating a DB row."""
+    issues = []
+    language_lower = str(language or "Python").lower()
+
+    if re.search(r"\beval\s*\(", code):
+        issues.append({
+            "severity": "HIGH",
+            "category": "Security",
+            "title": "Avoid using eval()",
+            "description": "eval() can execute arbitrary code. Avoid it with untrusted input.",
+        })
+
+    if re.search(r"\bexec\s*\(", code):
+        issues.append({
+            "severity": "HIGH",
+            "category": "Security",
+            "title": "Avoid using exec()",
+            "description": "exec() can execute arbitrary code and may create security vulnerabilities.",
+        })
+
+    if re.search(r"(password|passwd|secret|api_key|apikey)\s*=\s*['\"][^'\"]+['\"]", code, re.IGNORECASE):
+        issues.append({
+            "severity": "HIGH",
+            "category": "Security",
+            "title": "Possible hardcoded secret",
+            "description": "Sensitive credentials should not be stored directly in source code.",
+        })
+
+    if re.search(r"(sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,})", code):
+        issues.append({
+            "severity": "HIGH",
+            "category": "Security",
+            "title": "Possible API token detected",
+            "description": "Move API tokens to environment variables or a secret manager.",
+        })
+
+    if "while True:" in code:
+        issues.append({
+            "severity": "MEDIUM",
+            "category": "Performance",
+            "title": "Potential infinite loop",
+            "description": "Check whether the loop has a proper exit condition.",
+        })
+
+    if re.search(r"for\s+\w+\s+in\s+range\s*\(\s*len\(", code):
+        issues.append({
+            "severity": "LOW",
+            "category": "Performance",
+            "title": "Simplify iteration",
+            "description": "Consider iterating directly over the collection instead of range(len(...)).",
+        })
+
+    if language_lower == "python":
+        if re.search(r"except\s*:", code):
+            issues.append({
+                "severity": "LOW",
+                "category": "Code Quality",
+                "title": "Avoid bare except",
+                "description": "Catch a specific exception type instead of every exception.",
+            })
+        try:
+            ast.parse(code)
+        except SyntaxError as e:
+            issues.append({
+                "severity": "HIGH",
+                "category": "Bug",
+                "title": "Python syntax error",
+                "description": f"Syntax error near line {e.lineno}: {e.msg}",
+            })
+
+    if language_lower in {"javascript", "js"}:
+        if re.search(r"eval\s*\(", code):
+            issues.append({
+                "severity": "HIGH",
+                "category": "Security",
+                "title": "Avoid JavaScript eval()",
+                "description": "eval() can execute arbitrary JavaScript code.",
+            })
+        if "console.log(" in code:
+            issues.append({
+                "severity": "LOW",
+                "category": "Code Quality",
+                "title": "Remove console.log()",
+                "description": "Avoid unnecessary console logging in production code.",
+            })
+
+    if language_lower == "sql":
+        if re.search(r"select\s+\*", code, re.IGNORECASE):
+            issues.append({
+                "severity": "LOW",
+                "category": "Performance",
+                "title": "Avoid SELECT *",
+                "description": "Select only the columns that your application actually needs.",
+            })
+        if re.search(r"union\s+select", code, re.IGNORECASE):
+            issues.append({
+                "severity": "MEDIUM",
+                "category": "Security",
+                "title": "Review dynamic SQL",
+                "description": "Use parameterized queries when constructing SQL from user input.",
+            })
+
+    score = calculate_score(issues)
+    return {
+        "language": language,
+        "score": score,
+        "code_health": score,
+        "total_issues": len(issues),
+        "bugs": sum(1 for x in issues if x.get("category") == "Bug" or x.get("severity") == "HIGH"),
+        "security_issues": sum(1 for x in issues if x.get("category") == "Security"),
+        "performance_issues": sum(1 for x in issues if x.get("category") == "Performance"),
+        "suggestions": sum(1 for x in issues if x.get("severity") == "LOW" or x.get("category") == "Code Quality"),
+        "issues": issues,
+    }
+
+
+@app.route("/api/auto-fix", methods=["POST"])
+def auto_fix_code():
+    try:
+        data = request.get_json(silent=True) or {}
+        code = str(data.get("code", "")).strip()
+        language = data.get("language", "Python")
+        if not code:
+            return jsonify({"success": False, "error": "Code is required"}), 400
+
+        fixed = code
+        changes = []
+        unfixed = []
+        lang = str(language).lower()
+
+        if lang == "python" and re.search(r"\beval\s*\(", fixed):
+            new_fixed = re.sub(r"\beval\s*\(", "ast.literal_eval(", fixed)
+            if new_fixed != fixed:
+                fixed = new_fixed
+                if "import ast" not in fixed:
+                    fixed = "import ast\n\n" + fixed
+                changes.append({
+                    "title": "Replaced Python eval()",
+                    "description": "Used ast.literal_eval() for safer literal parsing. Verify the expected input format.",
+                })
+
+        secret_pattern = re.compile(r"((?:password|passwd|secret|api_key|apikey)\s*=\s*)['\"]([^'\"]+)['\"]", re.IGNORECASE)
+        if secret_pattern.search(fixed):
+            fixed = secret_pattern.sub(lambda m: m.group(1) + "os.getenv(\"" + re.sub(r"\W+", "_", m.group(1).split("=")[0].strip()).upper() + "\")", fixed)
+            if "import os" not in fixed:
+                fixed = "import os\n" + fixed
+            changes.append({
+                "title": "Moved hardcoded secret to environment variable",
+                "description": "The value is now read from an environment variable. Set the variable before running the program.",
+            })
+
+        if lang in {"javascript", "js"} and "console.log(" in fixed:
+            fixed = re.sub(r"^\s*console\.log\([^\n]*\);?\s*$\n?", "", fixed, flags=re.MULTILINE)
+            changes.append({
+                "title": "Removed console.log()",
+                "description": "Removed standalone debug logging lines from the JavaScript source.",
+            })
+
+        if re.search(r"\bexec\s*\(", code):
+            unfixed.append("exec() usage")
+        if "while True:" in code:
+            unfixed.append("while True loop")
+        if lang == "sql" and re.search(r"select\s+\*", code, re.IGNORECASE):
+            unfixed.append("SELECT * (column names are required for a safe automatic replacement)")
+
+        return jsonify({
+            "success": True,
+            "language": language,
+            "original_code": code,
+            "fixed_code": fixed,
+            "changes": changes,
+            "unfixed": unfixed,
+            "changed": fixed != code,
+            "message": "Safe automatic fixes generated. Review the result before using it in production." if changes else "No safe automatic fix was available for the detected issues.",
+        }), 200
+    except Exception as e:
+        print("AUTO-FIX ERROR:", e)
+        return jsonify({"success": False, "error": "Unable to generate automatic fix", "details": str(e)}), 500
+
+
+@app.route("/api/explain-issue", methods=["POST"])
+def explain_issue():
+    try:
+        data = request.get_json(silent=True) or {}
+        issue = data.get("issue") or {}
+        title = str(issue.get("title", "Code issue"))
+        category = str(issue.get("category", "Code Quality"))
+        severity = str(issue.get("severity", "INFO"))
+        description = str(issue.get("description", "Review this section of code."))
+
+        explanations = {
+            "Avoid using eval()": (
+                "eval() executes a string as code, so untrusted input can become executable code.",
+                "An attacker may supply unexpected expressions and gain code execution in the application's process.",
+                "Prefer normal parsing. In Python, use ast.literal_eval() when you only need Python literals; otherwise validate and parse the expected format explicitly.",
+                "import ast\nvalue = ast.literal_eval(user_text)",
+            ),
+            "Avoid using exec()": (
+                "exec() turns a string into executable code at runtime.",
+                "If the string is influenced by a user or external source, arbitrary code can run with the application's permissions.",
+                "Remove dynamic execution and replace it with explicit functions, mappings, or a safe parser.",
+                "handlers = {\"sum\": calculate_sum}\nresult = handlers[action](a, b)",
+            ),
+            "Possible hardcoded secret": (
+                "A credential is written directly into source code.",
+                "Anyone who gets the repository, build artifact, screenshot, or logs may obtain the secret. Secrets can also be accidentally committed to Git.",
+                "Read secrets from environment variables or a secret manager and rotate any credential that was already exposed.",
+                "import os\nAPI_KEY = os.getenv(\"API_KEY\")",
+            ),
+            "Potential infinite loop": (
+                "while True creates a loop with no visible termination condition.",
+                "The process can consume CPU indefinitely or hang a request if the exit condition is never reached.",
+                "Add a clear break condition, a bounded loop, or a timeout appropriate for the task.",
+                "while condition:\n    work()\n    if finished:\n        break",
+            ),
+            "Avoid bare except": (
+                "A bare except catches almost every exception, including errors you may not intend to hide.",
+                "It can mask real bugs and make debugging and monitoring much harder.",
+                "Catch the specific exception types you expect and handle or log them deliberately.",
+                "try:\n    value = int(text)\nexcept ValueError:\n    value = 0",
+            ),
+            "Remove console.log()": (
+                "console.log() is normally used for temporary debugging output.",
+                "Leaving debug logs in production can expose internal information and create noisy browser or server logs.",
+                "Remove unnecessary logs or replace them with a controlled logging system with appropriate levels.",
+                "const logger = { info: (message) => sendToLogger(message) };",
+            ),
+            "Avoid SELECT *": (
+                "SELECT * requests every column from a table.",
+                "It can transfer unnecessary data, increase query cost, and make code fragile when the table schema changes.",
+                "Select only the columns the application needs.",
+                "SELECT id, name, email\nFROM users;",
+            ),
+        }
+
+        if title in explanations:
+            what, why, how, example = explanations[title]
+        else:
+            what = description
+            why = f"This {category.lower()} issue has {severity.lower()} severity and should be reviewed before production use."
+            how = "Inspect the affected code, validate inputs, handle errors explicitly, and apply the recommendation shown by the code review."
+            example = "Review the affected line and replace the risky pattern with an explicit, validated implementation."
+
+        return jsonify({
+            "success": True,
+            "title": title,
+            "category": category,
+            "severity": severity,
+            "what": what,
+            "why": why,
+            "how": how,
+            "example": example,
+        }), 200
+    except Exception as e:
+        print("EXPLANATION ERROR:", e)
+        return jsonify({"success": False, "error": "Unable to generate explanation", "details": str(e)}), 500
+
+
+@app.route("/api/upload-review", methods=["POST"])
+def upload_review():
+    try:
+        uploaded = request.files.get("file")
+        if not uploaded or not uploaded.filename:
+            return jsonify({"success": False, "error": "Please select a source file or ZIP file."}), 400
+
+        filename = secure_filename(uploaded.filename)
+        if not filename:
+            return jsonify({"success": False, "error": "Invalid filename."}), 400
+
+        raw = uploaded.read()
+        if len(raw) > 5 * 1024 * 1024:
+            return jsonify({"success": False, "error": "File is too large. Maximum size is 5 MB."}), 413
+
+        files = []
+        if filename.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                    members = [m for m in zf.infolist() if not m.is_dir()]
+                    source_members = []
+                    for member in members:
+                        safe_name = member.filename.replace("\\", "/")
+                        if safe_name.startswith("__MACOSX/") or "/node_modules/" in f"/{safe_name}" or "/.git/" in f"/{safe_name}":
+                            continue
+                        ext = os.path.splitext(safe_name)[1].lower()
+                        if ext in SUPPORTED_SOURCE_EXTENSIONS:
+                            source_members.append(member)
+                    if len(source_members) > 20:
+                        return jsonify({"success": False, "error": "ZIP may contain at most 20 source files."}), 400
+                    total_uncompressed = 0
+                    for member in source_members:
+                        if member.file_size > 1024 * 1024:
+                            continue
+                        total_uncompressed += member.file_size
+                        if total_uncompressed > 5 * 1024 * 1024:
+                            break
+                        try:
+                            text = zf.read(member).decode("utf-8")
+                        except UnicodeDecodeError:
+                            continue
+                        ext = os.path.splitext(member.filename)[1].lower()
+                        files.append({
+                            "filename": member.filename,
+                            "language": SUPPORTED_SOURCE_EXTENSIONS[ext],
+                            "code": text,
+                        })
+            except zipfile.BadZipFile:
+                return jsonify({"success": False, "error": "The uploaded ZIP file is invalid."}), 400
+        else:
+            ext = os.path.splitext(filename)[1].lower()
+            if ext not in SUPPORTED_SOURCE_EXTENSIONS:
+                return jsonify({"success": False, "error": "Unsupported file type."}), 400
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                return jsonify({"success": False, "error": "The source file must be UTF-8 text."}), 400
+            files.append({"filename": filename, "language": SUPPORTED_SOURCE_EXTENSIONS[ext], "code": text})
+
+        if not files:
+            return jsonify({"success": False, "error": "No supported source files were found."}), 400
+
+        analyzed = []
+        for item in files:
+            result = analyze_uploaded_code(item["code"], item["language"])
+            analyzed.append({
+                "filename": item["filename"],
+                "language": item["language"],
+                "score": result["score"],
+                "total_issues": result["total_issues"],
+                "issues": result["issues"],
+            })
+
+        first = files[0]
+        first_result = analyze_uploaded_code(first["code"], first["language"])
+        return jsonify({
+            "success": True,
+            "message": f"Analyzed {len(analyzed)} source file(s) successfully.",
+            "files_analyzed": len(analyzed),
+            "files": analyzed,
+            "code": first["code"] if len(analyzed) == 1 else "",
+            "language": first["language"] if len(analyzed) == 1 else "Python",
+            "review": first_result if len(analyzed) == 1 else None,
+        }), 200
+    except Exception as e:
+        print("UPLOAD REVIEW ERROR:", e)
+        return jsonify({"success": False, "error": "Unable to analyze uploaded file", "details": str(e)}), 500
+
+
+# ============================================================
 # ERROR HANDLERS
 # ============================================================
 
@@ -3492,3 +3902,114 @@ if __name__ == "__main__":
         port=5000,
         debug=True
     )
+
+# ============================================================
+# AI CHAT ASSISTANT
+# ============================================================
+
+@app.route("/api/ai-chat", methods=["POST"])
+def ai_chat():
+    """AI coding assistant. Uses an OpenAI-compatible API when configured,
+    with a useful local fallback when no API key is available."""
+    try:
+        data = request.get_json(silent=True) or {}
+        message = str(data.get("message", "")).strip()
+        language = str(data.get("language", "Python"))
+        code = str(data.get("code", ""))
+        review = data.get("review") or {}
+        history = data.get("history") or []
+
+        if not message:
+            return jsonify({"success": False, "error": "Please enter a message."}), 400
+        if len(message) > 4000:
+            return jsonify({"success": False, "error": "Message is too long. Maximum 4000 characters."}), 400
+
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        api_url = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions").strip()
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+
+        system_prompt = """You are CodeReviewerAI Assistant, a helpful software-engineering tutor and code-review assistant.
+Give accurate, practical answers. Prefer concise explanations with examples.
+When reviewing code, discuss bugs, security, performance, readability and testing.
+Never claim that code was executed unless it actually was. If the user asks for a fix, provide corrected code when possible.
+"""
+
+        context_parts = [f"Selected language: {language}"]
+        if code:
+            context_parts.append("Current code:\n" + code[:12000])
+        if review:
+            context_parts.append("Latest review result:\n" + str(review)[:10000])
+        context = "\n\n".join(context_parts)
+
+        if api_key:
+            messages = [{"role": "system", "content": system_prompt + "\n\nContext:\n" + context}]
+            for item in history[-10:]:
+                role = item.get("role") if isinstance(item, dict) else None
+                content = item.get("content") if isinstance(item, dict) else None
+                if role in {"user", "assistant"} and content:
+                    messages.append({"role": role, "content": str(content)[:6000]})
+            if not messages or messages[-1].get("content") != message:
+                messages.append({"role": "user", "content": message})
+
+            api_response = requests.post(
+                api_url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "temperature": 0.2,
+                },
+                timeout=60,
+            )
+            if not api_response.ok:
+                try:
+                    error_data = api_response.json()
+                    error_message = error_data.get("error", {}).get("message", "AI provider request failed")
+                except Exception:
+                    error_message = "AI provider request failed"
+                return jsonify({"success": False, "error": error_message}), 502
+
+            result = api_response.json()
+            reply = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            if not reply:
+                return jsonify({"success": False, "error": "The AI provider returned an empty response."}), 502
+            return jsonify({"success": True, "reply": reply, "provider": "AI"}), 200
+
+        # Local fallback: useful even before an external AI key is configured.
+        lower = message.lower()
+        reply = None
+        if "eval" in lower or "eval(" in code:
+            reply = ("`eval()` can execute dynamically supplied code and is risky with untrusted input. "
+                     "For Python literals, prefer `ast.literal_eval()`; for other input, validate and parse the expected format explicitly.")
+        elif "security" in lower or "secure" in lower:
+            reply = ("For security, check hardcoded secrets, dynamic execution (`eval`/`exec`), unvalidated input, SQL construction, "
+                     "authentication and authorization. I can review your current code if you paste it into Code Review.")
+        elif "test" in lower:
+            reply = (f"For {language}, start with normal cases, boundary values, invalid input and failure cases. "
+                     "You can also open Test Generator and generate test cases directly from your current function.")
+        elif "explain" in lower and code:
+            lines = len(code.splitlines())
+            reply = (f"Your current {language} code has about {lines} lines. I can explain it section-by-section. "
+                     "For a detailed issue explanation, use Code Review and open Detailed Explanation on the detected issue.")
+        elif "fix" in lower and code:
+            reply = ("I can help fix the current code. For safe automatic fixes, open Code Review and use Auto-Fix Code; "
+                     "then review the generated result before using it in production.")
+        else:
+            reply = ("I’m ready to help with coding, debugging, security, performance, testing and learning. "
+                     "For the strongest answer, include the relevant code and tell me what you want to achieve.")
+
+        return jsonify({
+            "success": True,
+            "reply": reply,
+            "provider": "Local Assistant",
+            "note": "Set OPENAI_API_KEY to enable full AI-powered chat responses.",
+        }), 200
+    except requests.RequestException as e:
+        print("AI CHAT PROVIDER ERROR:", e)
+        return jsonify({"success": False, "error": "Unable to reach the AI provider."}), 502
+    except Exception as e:
+        print("AI CHAT ERROR:", e)
+        return jsonify({"success": False, "error": "Unable to process AI Chat", "details": str(e)}), 500

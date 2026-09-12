@@ -36,6 +36,15 @@ import {
   FolderPlus,
   UserPlus,
   Save,
+  Upload,
+  FileArchive,
+  Wrench,
+  FileText,
+  Info,
+  MessageCircle,
+  Send,
+  Bot,
+  UserRound,
 } from "lucide-react";
 
 import "./App.css";
@@ -81,6 +90,113 @@ function App() {
   const [reviewCount, setReviewCount] = useState(0);
   const [reviewLoading, setReviewLoading] = useState(false);
   const [reviewResult, setReviewResult] = useState(null);
+  const [selectedReviewIssue, setSelectedReviewIssue] = useState(null);
+  const [explanation, setExplanation] = useState(null);
+  const [explanationLoading, setExplanationLoading] = useState(false);
+  const [fixResult, setFixResult] = useState(null);
+  const [fixLoading, setFixLoading] = useState(false);
+  const [uploadLoading, setUploadLoading] = useState(false);
+  const [uploadResult, setUploadResult] = useState(null);
+
+  // ==========================================================
+  // AUTO-FIX / DETAILED EXPLANATION / FILE UPLOAD
+  // ==========================================================
+
+  const handleAutoFix = async () => {
+    if (!code.trim()) {
+      alert("Please paste your code first.");
+      return;
+    }
+
+    setFixLoading(true);
+    setFixResult(null);
+
+    try {
+      const response = await fetch(`${API_URL}/api/auto-fix`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ code, language }),
+      });
+      const data = await readJsonResponse(response);
+      if (!response.ok) throw new Error(data.error || "Auto-fix failed");
+      setFixResult(data);
+    } catch (error) {
+      console.error("Auto-fix error:", error);
+      alert("Auto-Fix failed.\n\n" + error.message);
+    } finally {
+      setFixLoading(false);
+    }
+  };
+
+  const handleExplainIssue = async (issue) => {
+    setSelectedReviewIssue(issue);
+    setExplanation(null);
+    setExplanationLoading(true);
+
+    try {
+      const response = await fetch(`${API_URL}/api/explain-issue`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ code, language, issue }),
+      });
+      const data = await readJsonResponse(response);
+      if (!response.ok) throw new Error(data.error || "Explanation failed");
+      setExplanation(data);
+    } catch (error) {
+      console.error("Explanation error:", error);
+      alert("Detailed explanation failed.\n\n" + error.message);
+    } finally {
+      setExplanationLoading(false);
+    }
+  };
+
+  const handleFileUpload = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+
+    const allowed = /\.(py|js|jsx|ts|tsx|java|cpp|cc|cxx|c|h|hpp|sql|zip)$/i;
+    if (!allowed.test(file.name)) {
+      alert("Supported files: Python, JavaScript, TypeScript, Java, C/C++, SQL or ZIP.");
+      return;
+    }
+
+    const formData = new FormData();
+    formData.append("file", file);
+    setUploadLoading(true);
+    setUploadResult(null);
+
+    try {
+      const response = await fetch(`${API_URL}/api/upload-review`, {
+        method: "POST",
+        credentials: "include",
+        body: formData,
+      });
+      const data = await readJsonResponse(response);
+      if (!response.ok) throw new Error(data.error || "File review failed");
+      setUploadResult(data);
+      if (data.code && data.language) {
+        setCode(data.code);
+        setLanguage(data.language);
+      }
+      if (data.review) setReviewResult(data.review);
+    } catch (error) {
+      console.error("File upload error:", error);
+      alert("File upload/review failed.\n\n" + error.message);
+    } finally {
+      setUploadLoading(false);
+    }
+  };
+
+  const copyText = async (text) => {
+    try {
+      await navigator.clipboard.writeText(text || "");
+    } catch (error) {
+      console.error("Copy failed:", error);
+    }
+  };
 
   // ==========================================================
   // TEST GENERATOR
@@ -110,6 +226,67 @@ function App() {
   // ==========================================================
 
   const [teamRefresh, setTeamRefresh] = useState(0);
+
+  // ==========================================================
+  // AI CHAT
+  // ==========================================================
+
+  const [chatMessages, setChatMessages] = useState([
+    {
+      role: "assistant",
+      content: "Hi! I’m CodeReviewerAI Assistant. Ask me about your code, bugs, security, performance, tests, or how to improve your latest review.",
+    },
+  ]);
+  const [chatInput, setChatInput] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+
+  const handleSendChat = async () => {
+    const message = chatInput.trim();
+    if (!message || chatLoading) return;
+
+    const nextMessages = [...chatMessages, { role: "user", content: message }];
+    setChatMessages(nextMessages);
+    setChatInput("");
+    setChatLoading(true);
+
+    try {
+      const response = await fetch(`${API_URL}/api/ai-chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          message,
+          language,
+          code,
+          review: reviewResult,
+          history: nextMessages.slice(-10),
+        }),
+      });
+      const data = await readJsonResponse(response);
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || "AI Chat failed");
+      }
+      setChatMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: data.reply || "I could not generate a response." },
+      ]);
+    } catch (error) {
+      console.error("AI Chat error:", error);
+      setChatMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: `Sorry, I couldn't answer that. ${error.message}` },
+      ]);
+    } finally {
+      setChatLoading(false);
+    }
+  };
+
+  const handleChatKeyDown = (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      handleSendChat();
+    }
+  };
 
   // ==========================================================
   // SETTINGS
@@ -228,6 +405,10 @@ function App() {
     {
       name: "Code Review",
       icon: Code2,
+    },
+    {
+      name: "AI Chat",
+      icon: MessageCircle,
     },
     {
       name: "GitHub PR",
@@ -708,6 +889,92 @@ function App() {
   };
 
   // ==========================================================
+  // SAVE REVIEW AS PDF
+  // ==========================================================
+
+  const handleSaveReviewPDF = (review) => {
+    if (!review) return;
+
+    const escapeHtml = (value) =>
+      String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/\"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+
+    const score = Number(review.score || 0);
+    const languageName = review.language || "Code";
+    const createdAt = review.created_at || review.date;
+    const codeText = review.code || "No source code was saved for this review.";
+
+    const printWindow = window.open("", "_blank", "width=900,height=800");
+    if (!printWindow) {
+      alert("Please allow pop-ups in your browser to save the PDF.");
+      return;
+    }
+
+    printWindow.document.write(`
+      <!doctype html>
+      <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>CodeReviewerAI - Review #${escapeHtml(review.id)}</title>
+        <style>
+          * { box-sizing: border-box; }
+          body { font-family: Arial, Helvetica, sans-serif; margin: 0; padding: 36px; color: #172033; background: #fff; }
+          .header { border-bottom: 3px solid #7c3aed; padding-bottom: 18px; margin-bottom: 24px; }
+          .brand { font-size: 27px; font-weight: 800; color: #7c3aed; }
+          .subtitle { margin-top: 5px; color: #64748b; font-size: 14px; }
+          h1 { margin: 0 0 6px; font-size: 24px; }
+          h2 { margin: 28px 0 10px; font-size: 18px; }
+          .meta { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 20px 0; }
+          .card { border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px; }
+          .label { font-size: 11px; text-transform: uppercase; color: #64748b; font-weight: 700; }
+          .value { margin-top: 5px; font-size: 20px; font-weight: 800; }
+          .score { color: #7c3aed; }
+          .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+          pre { white-space: pre-wrap; word-break: break-word; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 16px; font-family: Consolas, Monaco, monospace; font-size: 12px; line-height: 1.55; }
+          .footer { margin-top: 30px; padding-top: 14px; border-top: 1px solid #e2e8f0; color: #64748b; font-size: 11px; }
+          @media print { body { padding: 20px; } .no-print { display: none; } }
+        </style>
+      </head>
+      <body>
+        <div class="header">
+          <div class="brand">CodeReviewerAI</div>
+          <div class="subtitle">AI Code Review Report</div>
+        </div>
+        <h1>${escapeHtml(languageName)} Code Review</h1>
+        <div class="subtitle">Review #${escapeHtml(review.id)}${createdAt ? ` • ${escapeHtml(formatDate(createdAt))}` : ""}</div>
+
+        <div class="meta">
+          <div class="card"><div class="label">Code Health</div><div class="value score">${score}/100</div></div>
+          <div class="card"><div class="label">Language</div><div class="value">${escapeHtml(languageName)}</div></div>
+          <div class="card"><div class="label">Review ID</div><div class="value">#${escapeHtml(review.id)}</div></div>
+        </div>
+
+        <h2>Review Statistics</h2>
+        <div class="stats">
+          <div class="card"><div class="label">Bugs</div><div class="value">${Number(review.bugs || 0)}</div></div>
+          <div class="card"><div class="label">Security Issues</div><div class="value">${Number(review.security_issues || 0)}</div></div>
+          <div class="card"><div class="label">Performance Issues</div><div class="value">${Number(review.performance_issues || 0)}</div></div>
+          <div class="card"><div class="label">Suggestions</div><div class="value">${Number(review.suggestions || 0)}</div></div>
+        </div>
+
+        <h2>Source Code</h2>
+        <pre>${escapeHtml(codeText)}</pre>
+
+        <div class="footer">Generated by CodeReviewerAI • AI Code Review Report</div>
+        <script>
+          window.onload = function () { setTimeout(function () { window.print(); }, 350); };
+        <\/script>
+      </body>
+      </html>
+    `);
+    printWindow.document.close();
+  };
+
+  // ==========================================================
   // AUTH LOGOUT
   // ==========================================================
 
@@ -1028,150 +1295,211 @@ function App() {
         ================================================== */}
 
         {active === "Code Review" && (
-
           <section className="review-section">
-
             <div className="section-heading">
-
               <div>
-                <h2>
-                  Code Review
-                </h2>
-
-                <p>
-                  Paste your code below
-                  and let AI analyze it.
-                </p>
+                <h2>Code Review</h2>
+                <p>Review code, upload files, understand issues and generate safe fixes.</p>
               </div>
 
               <select
                 value={language}
                 onChange={(e) => {
-                  setLanguage(
-                    e.target.value
-                  );
+                  setLanguage(e.target.value);
                   setCode("");
                   setReviewResult(null);
+                  setFixResult(null);
+                  setExplanation(null);
                 }}
               >
-                <option value="Python">
-                  Python
-                </option>
-
-                <option value="JavaScript">
-                  JavaScript
-                </option>
-
-                <option value="Java">
-                  Java
-                </option>
-
-                <option value="C++">
-                  C++
-                </option>
-
-                <option value="SQL">
-                  SQL
-                </option>
+                <option value="Python">Python</option>
+                <option value="JavaScript">JavaScript</option>
+                <option value="Java">Java</option>
+                <option value="C++">C++</option>
+                <option value="SQL">SQL</option>
               </select>
-
             </div>
 
+            <div className="review-feature-toolbar">
+              <label className="feature-action upload-action">
+                <input
+                  type="file"
+                  accept=".py,.js,.jsx,.ts,.tsx,.java,.cpp,.cc,.cxx,.c,.h,.hpp,.sql,.zip"
+                  onChange={handleFileUpload}
+                  hidden
+                />
+                <Upload size={17} />
+                {uploadLoading ? "Analyzing..." : "Upload File / ZIP"}
+              </label>
+
+              <button
+                className="feature-action fix-action"
+                onClick={handleAutoFix}
+                disabled={fixLoading || !code.trim()}
+              >
+                <Wrench size={17} />
+                {fixLoading ? "Fixing..." : "Auto-Fix Code"}
+              </button>
+            </div>
 
             <div className="code-box">
-
               <div className="code-header">
-
-                <span>
-                  Your Code
-                </span>
-
-                <span>
-                  {language}
-                </span>
-
+                <span>Your Code</span>
+                <span>{language}</span>
               </div>
 
               <textarea
                 value={code}
-                onChange={(e) =>
-                  setCode(
-                    e.target.value
-                  )
-                }
-                placeholder={`Paste your ${language} code here...
-
-Example:
-
-def calculate_sum(a, b):
-    return a + b`}
+                onChange={(e) => {
+                  setCode(e.target.value);
+                  setFixResult(null);
+                  setExplanation(null);
+                }}
+                placeholder={`Paste your ${language} code here...\n\nExample:\n\ndef calculate_sum(a, b):\n    return a + b`}
               />
 
               <div className="code-footer">
-
-                <span>
-                  {code.length} characters
-                </span>
-
-                <button
-                  onClick={
-                    handleReview
-                  }
-                  disabled={
-                    reviewLoading
-                  }
-                >
+                <span>{code.length} characters</span>
+                <button onClick={handleReview} disabled={reviewLoading}>
                   <Play size={16} />
-
-                  {reviewLoading
-                    ? "Reviewing..."
-                    : "Review Code"}
+                  {reviewLoading ? "Reviewing..." : "Review Code"}
                 </button>
-
               </div>
-
             </div>
-
 
             <div className="code-review-info">
-
               <CheckCircle2 size={20} />
-
               <div>
-
-                <strong>
-                  AI Code Analysis
-                </strong>
-
-                <p>
-                  The AI checks your
-                  code for bugs,
-                  security,
-                  performance and
-                  code quality.
-                </p>
-
+                <strong>Three new tools</strong>
+                <p>Upload a source file/ZIP, get a detailed explanation for every issue, and generate safe automatic fixes.</p>
               </div>
-
             </div>
 
+            {uploadResult && (
+              <FileUploadResult result={uploadResult} />
+            )}
 
-            {reviewResult && (
-              <ReviewResult
-                reviewResult={
-                  reviewResult
-                }
-                language={language}
+            {fixResult && (
+              <AutoFixResult
+                result={fixResult}
+                onCopy={() => copyText(fixResult.fixed_code)}
               />
             )}
 
+            {reviewResult && (
+              <ReviewResult
+                reviewResult={reviewResult}
+                language={language}
+                onExplainIssue={handleExplainIssue}
+              />
+            )}
+
+            {selectedReviewIssue && (
+              <ExplanationPanel
+                issue={selectedReviewIssue}
+                explanation={explanation}
+                loading={explanationLoading}
+                onClose={() => {
+                  setSelectedReviewIssue(null);
+                  setExplanation(null);
+                }}
+              />
+            )}
           </section>
         )}
-
 
         {/* ==================================================
             GITHUB PR
         ================================================== */}
+
+        {active === "AI Chat" && (
+          <section className="ai-chat-section">
+            <div className="ai-chat-header">
+              <div>
+                <div className="ai-chat-title-row">
+                  <div className="ai-chat-bot-icon"><Bot size={22} /></div>
+                  <div>
+                    <h2>AI Coding Assistant</h2>
+                    <p>Ask questions, explain code, find bugs, improve security and understand your reviews.</p>
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                className="secondary-btn"
+                onClick={() => setChatMessages([{ role: "assistant", content: "Chat cleared. What would you like to build or fix?" }])}
+              >
+                New Chat
+              </button>
+            </div>
+
+            <div className="ai-chat-quick-actions">
+              {[
+                "Explain my current code",
+                "Find security problems",
+                "How can I improve this code?",
+                "Generate tests for my code",
+              ].map((prompt) => (
+                <button
+                  type="button"
+                  key={prompt}
+                  onClick={() => setChatInput(prompt)}
+                >
+                  {prompt}
+                </button>
+              ))}
+            </div>
+
+            <div className="ai-chat-window">
+              {chatMessages.map((item, index) => (
+                <div key={`${item.role}-${index}`} className={`chat-message ${item.role === "user" ? "chat-user" : "chat-assistant"}`}>
+                  <div className="chat-avatar">
+                    {item.role === "user" ? <UserRound size={17} /> : <Bot size={17} />}
+                  </div>
+                  <div className="chat-bubble">
+                    <span className="chat-role">{item.role === "user" ? "You" : "CodeReviewerAI"}</span>
+                    <div className="chat-content">{item.content}</div>
+                  </div>
+                </div>
+              ))}
+
+              {chatLoading && (
+                <div className="chat-message chat-assistant">
+                  <div className="chat-avatar"><Bot size={17} /></div>
+                  <div className="chat-bubble">
+                    <span className="chat-role">CodeReviewerAI</span>
+                    <div className="chat-typing">Thinking<span>.</span><span>.</span><span>.</span></div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="ai-chat-input-wrap">
+              <textarea
+                value={chatInput}
+                onChange={(event) => setChatInput(event.target.value)}
+                onKeyDown={handleChatKeyDown}
+                placeholder="Ask anything about your code... (Enter to send)"
+                rows={2}
+                disabled={chatLoading}
+              />
+              <button
+                type="button"
+                className="ai-chat-send-btn"
+                onClick={handleSendChat}
+                disabled={!chatInput.trim() || chatLoading}
+              >
+                <Send size={17} />
+                {chatLoading ? "Thinking..." : "Send"}
+              </button>
+            </div>
+
+            <div className="ai-chat-context-note">
+              <Info size={15} /> The assistant can use your current code, selected language and latest review as context.
+            </div>
+          </section>
+        )}
+
 
         {active === "GitHub PR" && (
           <GitHubPR
@@ -1462,6 +1790,8 @@ def add(a, b):
                       }
                       reviewId={item.id}
                       onDelete={handleDeleteReview}
+                      onSavePDF={handleSaveReviewPDF}
+                      review={item}
                     />
 
                   )
@@ -1856,6 +2186,8 @@ function TeamWorkspace({ user, apiUrl, darkMode, onRefresh, refreshKey }) {
   const [sharedLanguage, setSharedLanguage] = useState("Python");
   const [saveLoading, setSaveLoading] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [deleteTeamTarget, setDeleteTeamTarget] = useState(null);
+  const [deleteTeamLoading, setDeleteTeamLoading] = useState(false);
 
   const request = async (url, options = {}) => {
     const response = await fetch(`${apiUrl}${url}`, {
@@ -1994,6 +2326,28 @@ function TeamWorkspace({ user, apiUrl, darkMode, onRefresh, refreshKey }) {
     } catch (e) { setError(e.message); } finally { setSaveLoading(false); }
   };
 
+  const deleteTeam = async () => {
+    if (!deleteTeamTarget) return;
+    setDeleteTeamLoading(true); setError(""); setMessage("");
+    try {
+      await request(`/api/teams/${deleteTeamTarget.id}`, { method: "DELETE" });
+      const deletedName = deleteTeamTarget.name;
+      setDeleteTeamTarget(null);
+      setSelectedTeam(null);
+      setTeamDetails(null);
+      setProjects([]);
+      setSelectedProject(null);
+      setSharedCode("");
+      setMessage(`Team "${deletedName}" deleted successfully.`);
+      await loadTeams(false);
+      onRefresh?.();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setDeleteTeamLoading(false);
+    }
+  };
+
   if (!user) {
     return <section className="team-workspace"><div className="team-empty"><Users size={42}/><h2>Team Workspace</h2><p>Please login to create or join a team.</p></div></section>;
   }
@@ -2028,7 +2382,23 @@ function TeamWorkspace({ user, apiUrl, darkMode, onRefresh, refreshKey }) {
           ) : (
             <>
               <div className="team-card team-members-card">
-                <div className="team-card-header"><div><h3>{selectedTeam.name}</h3><p>Shared workspace</p></div><span className="online-badge">● Team</span></div>
+                <div className="team-card-header">
+                  <div><h3>{selectedTeam.name}</h3><p>Shared workspace</p></div>
+                  <div className="team-header-actions">
+                    <span className="online-badge">● Team</span>
+                    {selectedTeam.owner_id === user.id && (
+                      <button
+                        type="button"
+                        className="delete-team-btn"
+                        onClick={() => setDeleteTeamTarget(selectedTeam)}
+                        disabled={deleteTeamLoading}
+                        title="Delete this team"
+                      >
+                        <Trash2 size={16}/> Delete Team
+                      </button>
+                    )}
+                  </div>
+                </div>
                 <div className="team-members">
                   {(teamDetails?.members || []).map((member) => <div className="team-member" key={member.id}><span className="member-avatar">{member.name?.charAt(0)?.toUpperCase() || "U"}</span><span><strong>{member.name}</strong><small>{member.role} · {member.email}</small></span></div>)}
                 </div>
@@ -2051,6 +2421,23 @@ function TeamWorkspace({ user, apiUrl, darkMode, onRefresh, refreshKey }) {
           )}
         </div>
       </div>
+
+      {deleteTeamTarget && (
+        <div className="team-modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !deleteTeamLoading) setDeleteTeamTarget(null); }}>
+          <div className="team-delete-modal" role="dialog" aria-modal="true" aria-labelledby="delete-team-title">
+            <div className="team-delete-icon"><Trash2 size={25}/></div>
+            <h3 id="delete-team-title">Delete Team</h3>
+            <p>Are you sure you want to delete <strong>"{deleteTeamTarget.name}"</strong>?</p>
+            <p className="team-delete-warning">This action cannot be undone. The team, its members, and shared projects will be permanently removed.</p>
+            <div className="team-delete-actions">
+              <button type="button" className="team-cancel-btn" onClick={() => setDeleteTeamTarget(null)} disabled={deleteTeamLoading}>Cancel</button>
+              <button type="button" className="team-confirm-delete-btn" onClick={deleteTeam} disabled={deleteTeamLoading}>
+                <Trash2 size={16}/> {deleteTeamLoading ? "Deleting..." : "Delete Team"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   );
 }
@@ -2334,6 +2721,7 @@ function Dashboard({
 function ReviewResult({
   reviewResult,
   language,
+  onExplainIssue,
 }) {
   const score = Number(
     reviewResult.score || 0
@@ -2463,23 +2851,14 @@ function ReviewResult({
                   type={
                     severity === "HIGH"
                       ? "high"
-                      : severity ===
-                        "MEDIUM"
+                      : severity === "MEDIUM"
                       ? "medium"
-                      : severity ===
-                        "LOW"
-                      ? "good"
                       : "good"
                   }
                   level={severity}
-                  title={
-                    issue.title ||
-                    "Code Issue"
-                  }
-                  description={
-                    issue.description ||
-                    "Review this section of code."
-                  }
+                  title={issue.title || "Code Issue"}
+                  description={issue.description || "Review this section of code."}
+                  onExplain={() => onExplainIssue?.(issue)}
                 />
               );
             }
@@ -2516,6 +2895,109 @@ function ReviewResult({
   );
 }
 
+
+// ============================================================
+// AUTO-FIX RESULT
+// ============================================================
+
+function AutoFixResult({ result, onCopy }) {
+  return (
+    <section className="feature-result auto-fix-result">
+      <div className="feature-result-header">
+        <div>
+          <h3><Wrench size={20} /> Auto-Fix Result</h3>
+          <p>{result.message || "Safe automatic fixes generated."}</p>
+        </div>
+        <button onClick={onCopy}><Copy size={16} /> Copy Fixed Code</button>
+      </div>
+
+      {Array.isArray(result.changes) && result.changes.length > 0 && (
+        <div className="fix-changes">
+          {result.changes.map((change, index) => (
+            <div key={index} className="fix-change">
+              <strong>{change.title}</strong>
+              <span>{change.description}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {result.unfixed && result.unfixed.length > 0 && (
+        <div className="fix-unfixed">
+          <strong>Needs manual review:</strong> {result.unfixed.join(", ")}
+        </div>
+      )}
+
+      <pre className="fixed-code-block">{result.fixed_code}</pre>
+    </section>
+  );
+}
+
+// ============================================================
+// FILE / ZIP UPLOAD RESULT
+// ============================================================
+
+function FileUploadResult({ result }) {
+  return (
+    <section className="feature-result upload-result">
+      <div className="feature-result-header">
+        <div>
+          <h3><FileArchive size={20} /> File / ZIP Analysis</h3>
+          <p>{result.message}</p>
+        </div>
+        <strong>{result.files_analyzed || 0} files analyzed</strong>
+      </div>
+
+      {result.review && (
+        <div className="upload-summary">
+          <span>Score: <b>{result.review.score}/100</b></span>
+          <span>Issues: <b>{result.review.total_issues}</b></span>
+        </div>
+      )}
+
+      <div className="uploaded-files-list">
+        {(result.files || []).map((file, index) => (
+          <div key={index} className="uploaded-file-item">
+            <FileText size={17} />
+            <div>
+              <strong>{file.filename}</strong>
+              <span>{file.language} · Score {file.score}/100 · {file.total_issues} issues</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+// ============================================================
+// DETAILED EXPLANATION PANEL
+// ============================================================
+
+function ExplanationPanel({ issue, explanation, loading, onClose }) {
+  return (
+    <section className="feature-result explanation-result">
+      <div className="feature-result-header">
+        <div>
+          <h3><Brain size={20} /> Detailed Explanation</h3>
+          <p>{issue?.title || "Code issue"}</p>
+        </div>
+        <button onClick={onClose}>Close</button>
+      </div>
+
+      {loading ? (
+        <div className="explanation-loading">Analyzing this issue...</div>
+      ) : explanation ? (
+        <div className="explanation-grid">
+          <div><strong>What is the problem?</strong><p>{explanation.what}</p></div>
+          <div><strong>Why does it matter?</strong><p>{explanation.why}</p></div>
+          <div><strong>How should you fix it?</strong><p>{explanation.how}</p></div>
+          <div><strong>Example</strong><pre>{explanation.example}</pre></div>
+        </div>
+      ) : null}
+    </section>
+  );
+}
 
 // ============================================================
 // TEST GENERATOR RESULT
@@ -4183,6 +4665,7 @@ function Issue({
   level,
   title,
   description,
+  onExplain,
 }) {
   return (
     <div
@@ -4201,9 +4684,13 @@ function Issue({
           {title}
         </strong>
 
-        <p>
-          {description}
-        </p>
+        <p>{description}</p>
+        {onExplain && (
+          <button className="issue-explain-button" onClick={onExplain}>
+            <Info size={15} />
+            Detailed Explanation
+          </button>
+        )}
 
       </div>
 
@@ -4223,6 +4710,8 @@ function HistoryItem({
   date,
   reviewId,
   onDelete,
+  onSavePDF,
+  review,
 }) {
   return (
     <div className="history-item">
@@ -4236,6 +4725,19 @@ function HistoryItem({
 
       <span className="history-result">{result}</span>
 
+      {onSavePDF && reviewId && (
+        <button
+          type="button"
+          className="history-pdf-btn"
+          title="Save review as PDF"
+          aria-label="Save review as PDF"
+          onClick={() => onSavePDF(review)}
+        >
+          <FileText size={17} />
+          <span>Save PDF</span>
+        </button>
+      )}
+
       {onDelete && reviewId && (
         <button
           type="button"
@@ -4245,6 +4747,7 @@ function HistoryItem({
           onClick={() => onDelete(reviewId)}
         >
           <Trash2 size={17} />
+          <span>Delete</span>
         </button>
       )}
     </div>
