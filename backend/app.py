@@ -56,10 +56,12 @@ CORS(
 # Flask session settings.
 # Render runs over HTTPS, while local development normally uses HTTP.
 app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["SESSION_COOKIE_SECURE"] = (
-    os.getenv("SESSION_COOKIE_SECURE", "0") == "1"
-)
+
+SESSION_SECURE = os.getenv("SESSION_COOKIE_SECURE", "0") == "1"
+
+app.config["SESSION_COOKIE_SECURE"] = SESSION_SECURE
+app.config["SESSION_COOKIE_SAMESITE"] = "None" if SESSION_SECURE else "Lax"
+app.config["SESSION_COOKIE_PATH"] = "/"
 
 db = SQLAlchemy(app)
 
