@@ -28,14 +28,37 @@ app.config["SECRET_KEY"] = os.getenv(
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///code_reviewer.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
+# Production-safe CORS configuration.
+# The frontend and backend are deployed on different Render origins,
+# so credentials must be enabled and the frontend origin must be explicit.
+FRONTEND_URL = os.getenv(
+    "FRONTEND_URL",
+    "https://ai-code-reviewer-1-ctee.onrender.com"
+).rstrip("/")
+
+ALLOWED_ORIGINS = [
+    FRONTEND_URL,
+    "https://ai-code-reviewer-1-ctee.onrender.com",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
 CORS(
     app,
     supports_credentials=True,
     resources={
         r"/api/*": {
-            "origins": "*"
+            "origins": ALLOWED_ORIGINS
         }
     }
+)
+
+# Flask session settings.
+# Render runs over HTTPS, while local development normally uses HTTP.
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = (
+    os.getenv("SESSION_COOKIE_SECURE", "0") == "1"
 )
 
 db = SQLAlchemy(app)
